@@ -903,14 +903,38 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _host_kv_packed(head_dim, index_hd):
+    """The packed cache engaged on the host (the engine's v41_host_kvq, mirrored):
+    COLI_VK_KV_FP32 unset/0 -- the default, which packs the host's KV state exactly when
+    it packs the device mirrors -- AND the geometry the formats are defined at. `1`
+    (or true/false's kin) is the exact fp32 opt-out: the fp32 layout, priced fp32."""
+    flag = os.environ.get("COLI_VK_KV_FP32")
+    if flag and flag not in ("0", "false", "off", "no"):
+        return False
+    return head_dim == 512 and index_hd == 128
+
+
+# The packed host's row widths, in bytes (c/dsv41_kvq.h: KVQ_WIN_BYTES, KVQ_CKV_BYTES,
+# KVQ_IKEY_BYTES), which the engine's host arrays hold a row while the cache is packed.
+_KVQ_WIN_BYTES = 528
+_KVQ_CKV_BYTES = 288
+_KVQ_IKEY_BYTES = 68
+
+
 def _dsv41_geometry(config, context, _model_dir):
     """DeepSeek V4.1 Flash: window ring, compressed KV and index keys, engram rows.
 
-    What the engine keeps resident per layer (deepseek_v41.c model_load):
+    What the engine keeps resident per layer (deepseek_v41.c model_load), the fixed term
+    being the engine's own v41_host_kv_bytes:
 
-        window ring   n_layers * window_size * head_dim * 4      (fixed)
-        compressed KV ceil(context / ratio) * head_dim * 4       (per kv source)
-        index keys    ceil(context / ratio) * index_head_dim * 4 (per kv source)
+        window ring     (n_layers + stages) * window_size * row        fixed
+        rollback rows   n_layers * (spec_block + 1) * row              fixed
+        compressed KV   ceil(context / ratio) * head_dim * 4           per kv source
+        index keys      ceil(context / ratio) * index_head_dim * 4     per kv source
+
+    The two fixed terms do not grow with the context: a window ring a layer and a DSpark
+    stage, plus the ring rows a speculative verify parks (spec_block + 1 a layer), at
+    528 B a row while the host is packed and head_dim * 4 otherwise.
 
     The engram tables are NOT in here on purpose: 203 GB of the released
     checkpoint is n-gram memory read row by row from disk (264 bytes per row,
@@ -919,8 +943,11 @@ def _dsv41_geometry(config, context, _model_dir):
     Counting them as resident would tell a user with 128 GB that this model
     cannot be served, which is the opposite of true.
 
-    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies
-    plus the sublayer scratch, at batch == context.
+    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies plus
+    the sublayer scratch, at one prompt chunk rather than the whole context
+    (deepseek_v41.c prefill reads a prompt in chunks, default 1280 rows;
+    COLI_VK_CHAIN_ROWS / COLI_PROMPT_SEGMENT set the chunk size). Pricing the
+    full context over-reserves RAM and starves the experts at long ctx.
     """
     section = config.get("text_config", config)
     layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
@@ -941,11 +968,48 @@ def _dsv41_geometry(config, context, _model_dir):
         raise ValueError("deepseek_v41: kv_source_layer_ids must be a list")
 
     # The DSpark stages keep a window ring each, on the same terms as a layer: their
-    # attention is window-only, and the window holds the main stream's keys.
-    stages = section.get("n_mtp_layers") or 0
+    # attention is window-only, and the window holds the main stream's keys. The
+    # released config.json carries no n_mtp_layers -- it spells the count
+    # num_nextn_predict_layers -- so a planner reading only the vendor's
+    # inference/config.json spelling priced 40 rings for a checkpoint whose engine
+    # keeps 43.
+    if "n_mtp_layers" in section:
+        stages = section["n_mtp_layers"]
+    else:
+        stages = section.get("num_nextn_predict_layers", 0)
     if not isinstance(stages, int) or isinstance(stages, bool) or stages < 0:
-        raise ValueError("deepseek_v41: n_mtp_layers must be a non-negative integer")
-    fixed = (layers + stages) * window * head_dim * 4
+        raise ValueError("deepseek_v41: n_mtp_layers or num_nextn_predict_layers must be "
+                         "a non-negative integer")
+    # A speculative verify parks the ring keys it displaces: one row a layer, and
+    # spec_block + 1 of them (the batch plus the row it rolls back to), the engine's
+    # own `rows` in model_load and v41_host_kv_check. Sized from spec_block, never from
+    # the stage count: the block size is what bounds a batch.
+    spec_block = section.get("dspark_block_size", 0)
+    if not isinstance(spec_block, int) or isinstance(spec_block, bool) or spec_block < 0:
+        raise ValueError("deepseek_v41: dspark_block_size must be a non-negative integer")
+    rows = spec_block + 1 if spec_block > 0 else 1
+    # The engine also zeroes the stage count when there is no block to draft with or no
+    # target layers to draft at (deepseek_v41.c: `if (spec_block <= 0 || n_spec_targets
+    # <= 0) n_mtp = 0`), so a config that spells a stage count without either loads no
+    # head and keeps no stage rings. The stage term otherwise assumes DSpark loaded (the
+    # default, one KV slot): V41_DSPARK=0 or a mux leaves the rings unallocated and this
+    # term still reserves them, which is conservative and named in docs/deepseek-v41.md.
+    if spec_block <= 0 or not section.get("dspark_target_layer_ids"):
+        stages = 0
+    # The packed cache (COLI_VK_KV_FP32 unset) prices the packed host layout: the window
+    # ring, the compressed rows and the index keys are the cache's own code rows (528,
+    # 288 and 68 B, c/dsv41_kvq.h) instead of head_dim * 4, (head_dim + index_head_dim) *
+    # 4 fp32 bytes -- 356 B against 2560 B a row at the released geometry, 86.1% less.
+    # THE INVARIANT this rests on, and the engine's v41_host_kvq states: under the flag the
+    # HOST layout is packed and STAYS packed for the process's life -- the KV split's
+    # give-way reverts the device mirrors to fp32 whole, never the host (the split's paths
+    # read the codes), so the re-price holds whenever the flag engages, split or not. The
+    # same geometry guard as the engine's (the formats are defined at head_dim 512 /
+    # index_head_dim 128): at any other geometry the engine keeps the fp32 host and the
+    # fp32 price is the honest one.
+    kvq_host = _host_kv_packed(head_dim, index_hd)
+    row = _KVQ_WIN_BYTES if kvq_host else head_dim * 4
+    fixed = ((layers + stages) * window + layers * rows) * row
     state = 0
     for layer in sources:
         if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:
@@ -954,9 +1018,26 @@ def _dsv41_geometry(config, context, _model_dir):
         if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
             raise ValueError("deepseek_v41: a kv source layer must compress")
         compressed = (context + ratio - 1) // ratio
-        state += compressed * (head_dim + index_hd) * 4
+        state += compressed * ((_KVQ_CKV_BYTES + _KVQ_IKEY_BYTES) if kvq_host else (head_dim + index_hd) * 4)
 
-    workspace = (context * hc_mult * hidden * 2 + context * hidden * 2 + hidden) * 4
+    # Price the workspace at one prompt chunk, not the whole context (deepseek_v41.c
+    # prefill: default 1280 rows; COLI_VK_CHAIN_ROWS and COLI_PROMPT_SEGMENT change
+    # the chunk size, matching the qwen38 convention). Full-context workspace
+    # starves the RAM expert cache at long ctx even though serve never holds those
+    # buffers at once.
+    try:
+        _chunk = int(os.environ.get("COLI_PROMPT_SEGMENT", "") or 0)
+    except (TypeError, ValueError):
+        _chunk = 0
+    if _chunk < 1:
+        try:
+            _chunk = int(os.environ.get("COLI_VK_CHAIN_ROWS", "") or 0)
+        except (TypeError, ValueError):
+            _chunk = 0
+        if _chunk < 1:
+            _chunk = 1280
+    ws_rows = min(context, _chunk)
+    workspace = (ws_rows * hc_mult * hidden * 2 + ws_rows * hidden * 2 + hidden) * 4
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
